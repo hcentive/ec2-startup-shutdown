@@ -1,0 +1,18 @@
+logger:
+  home: "/var/log/ec2/"
+  file: "startup_shutdown.log"
+
+mail:
+  administrator: "satyendra.sharma@hcentive.com"
+
+aws:
+  shutdown_pre: 300
+  tags:
+    start_time: "starttime"
+    stop_time: "stoptime"
+    cost_center: "cost-center"
+    stack: "stack"
+    owner: "owner"
+    name: "Name"
+    created_date: "created"
+    expiry_date: "expires"

@@ -1,0 +1,280 @@
+#!/usr/bin/env ruby
+# encoding: UTF-8
+require 'rubygems'
+require 'bundler/setup'
+require 'aws-sdk-core'
+require 'thor'
+require 'time'
+require 'logger'
+require_relative 'settings'
+
+class Ec2 < Thor
+	include Settings
+
+	Settings.load!(File.dirname(__FILE__) + '/config/ec2.yml')
+	# TODO : move logging to a mixin
+	loghome = Settings.logger[:home]
+	Dir.mkdir(loghome) unless Dir.exist?(loghome)
+	loghome.concat(Settings.logger[:file])
+	logfile = File.open(loghome, "a+")
+	@@logger = Logger.new(logfile, 'daily')
+	@@logger = Logger.new(logfile, 'weekly')
+	@@logger = Logger.new(logfile, 'monthly')
+	@@logger.level = Logger::INFO
+	@@logger.formatter = proc do |severity, datetime, progname, msg|
+		"[#{datetime}] : #{severity} : #{progname} - #{msg}\n"
+	end
+	@@administrator = Settings.mail[:administrator]
+
+	begin
+		@@ec2 = Aws::EC2.new
+		@@ses = Aws::SES.new
+	rescue Aws::Errors::ServiceError, Aws::Errors::MissingCredentialsError => e
+		@@logger.error "Ec2 startup failed - #{e.message}"
+		e.backtrace.each { |line| @@logger.error line }
+		raise e
+	ensure
+		@@logger.info {"Instantiating Ec2"}
+	end
+
+	desc "list COST-CENTER STACK", "List instances, with state, for a cost center (e.g. techops, shared-services, phix) and stack (e.g. dev, qa, sit)"
+	method_option :cost_center, :required => true, :aliases => "-c", :type => :array, :desc => "cost-center - space separated list of cost center for the instances"
+	method_option :stack, :aliases => "-s", :type => :array, :desc => "stack - space separated list of stack for the instances"
+	def list
+		@@logger.progname = "#{self.class.name}:#{__method__.to_s}"
+		@@logger.info {"[Start] #{__method__.to_s}"}
+
+		# look up instances
+		filters = Array.new
+		filters << {name: "tag:cost-center", values: options[:cost_center]}
+		filters << {name: "tag:stack", values: options[:stack]} unless options[:stack].nil?
+
+		resp = desc_instances(filters)
+
+		# list instances
+		resp.reservations.each do |reservation|
+			reservation.instances.each do |instance|
+				begin
+					@@logger.info {
+						"#{instance.instance_id}: #{instance.tags.find{|tag| tag.key == "Name"}.value} (#{instance.state.name}), " +
+						"StartTime: #{instance.tags.find{|tag| tag.key == "starttime"}.value}, " +
+						"StopTime: #{instance.tags.find{|tag| tag.key == "stoptime"}.value}, " +
+						"Expires: #{instance.tags.find{|tag| tag.key == "expires"}.value}, " +
+						"Owner: #{instance.tags.find{|tag| tag.key == "owner"}.value}, " +
+						"InstanceType: #{instance.instance_type}"
+					}
+				rescue Exception => e
+					@@logger.error e
+					e.backtrace.each { |line| @@logger.error line }
+					send_notification([@@administrator], "#{@@logger.progname} failed - #{instance.instance_id}",
+					"Instance listing failed - #{e.message}\n #{e.backtrace}")
+				end
+			end
+		end
+		@@logger.info {"[Stop] #{__method__.to_s}"}
+	end
+
+	desc "stop_instances COST-CENTER STACK", "Stop running instances marked to be stopped at the hour for a stack e.g. dev, QA, SIT"
+	method_option :cost_center, :required => true, :aliases => "-c", :type => :array, :desc => "cost-center - space separated list of cost center for the instances"
+	method_option :stack, :aliases => "-s", :type => :array, :desc => "stack - space separated list of stack for the instances"
+	method_option :dry_run, :aliases => "-d", :type => :boolean, :default => :false, :desc => "dry run - does not stop instances"
+	method_option :notify_owner, :aliases => "-n", :type => :boolean, :default => :true, :desc => "notify - notify owner after stopping instance"
+	method_option :no_prompt, :aliases => "-y", :type => :boolean, :default => :false, :desc => "no-prompt - automatic yes to prompts"
+	def stop_instances
+		@@logger.progname = "#{self.class.name}:#{__method__.to_s}"
+		@@logger.info {"[Start] #{__method__.to_s}"}
+		filters = Array.new
+		filters << {name: "instance-state-name", values: ["running"]}
+		filters << {name: "tag:stack", values: options[:stack]}
+		filters << {name: "tag:cost-center", values: options[:cost_center]} unless options[:cost_center].nil?
+
+		resp = desc_instances(filters)
+
+		#stop each instance that has "stoptime" tag value for the next hour
+		resp.reservations.each do |reservation|
+			reservation.instances.each do |instance|
+				begin
+					stoptime = instance.tags.find{|tag| tag.key == "stoptime"}.value
+					if !stoptime.nil? and Time.parse(stoptime) < Time.now + Settings.aws[:shutdown_pre] then
+						if options[:no_prompt] == :false then
+							stop_instance(instance, options[:dry_run], options[:notify_owner]) unless no?("Stop instance #{instance.tags.find{|tag| tag.key == "Name"}.value} (#{instance.instance_id})? [y/n]")
+						else
+							stop_instance(instance, options[:dry_run], options[:notify_owner])
+						end
+					end
+				rescue Aws::Errors::ServiceError => e
+					@@logger.error e
+					e.backtrace.each { |line| @@logger.error line }
+					send_notification([@@administrator], "#{@@logger.progname} failed", "stop_instance failed - #{e.message} \n\n#{e.backtrace}.")
+				end
+			end
+		end
+		send_notification([@@administrator], "#{@@logger.progname} run complete", "#{@@logger.progname} run ended at #{Time.now}")
+		@@logger.info {"[Stop] #{__method__.to_s}"}
+	end
+
+	desc "start_instances COST-CENTER STACK", "Start stopped instances marked to be started at the hour for a stack e.g. dev, QA, SIT"
+	method_option :cost_center, :required => true, :aliases => "-c", :type => :array, :desc => "cost-center - space separated list of cost center for the instances"
+	method_option :stack, :aliases => "-s", :type => :array, :desc => "stack - space separated list of stack for the instances"
+	method_option :dry_run, :aliases => "-d", :type => :boolean, :default => :false, :desc => "dry run - does not start instances"
+	method_option :notify_owner, :aliases => "-n", :type => :boolean, :default => :true, :desc => "notify - notify owner after starting instance"
+	method_option :no_prompt, :aliases => "-y", :type => :boolean, :default => :false, :desc => "no-prompt - automatic yes to prompts"
+	def start_instances
+		@@logger.progname = "#{self.class.name}:#{__method__.to_s}"
+		@@logger.info {"[Start] #{__method__.to_s}"}
+		filters = Array.new
+		filters << {name: "instance-state-name", values: ["stopped"]}
+		filters << {name: "tag:stack", values: options[:stack]}
+		filters << {name: "tag:cost-center", values: options[:cost_center]} unless options[:cost_center].nil?
+
+		resp = desc_instances(filters)
+
+		#start each instance that has "StartTime" tag value for the past hour
+		resp.reservations.each do |reservation|
+			reservation.instances.each do |instance|
+				begin
+					starttime = instance.tags.find{|tag| tag.key == "starttime"}.value
+					if !starttime.nil? and Time.parse(starttime) >= Time.now then
+						if options[:no_prompt] == :false then
+							start_instance(instance, options[:dry_run], options[:notify_owner]) unless no?("Start instance #{instance.tags.find{|tag| tag.key == "Name"}.value} (#{instance.instance_id})? [y/n]")
+						else
+							start_instance(instance, options[:dry_run], options[:notify_owner])
+						end
+					end
+				rescue Aws::Errors::ServiceError => e
+					@@logger.error e
+					e.backtrace.each { |line| @@logger.error line }
+					send_notification([@@administrator], "#{@@logger.progname} failed", "start_instance failed - #{e.message} \n\n#{e.backtrace}.")
+				end
+			end
+		end
+		send_notification([@@administrator], "#{@@logger.progname} run complete", "#{@@logger.progname} run ended at #{Time.now}")
+		@@logger.info {"[Stop] #{__method__.to_s}"}
+	end
+
+	desc "audit_tags COST-CENTER STACK", "Audit instance tags; add missing tags. Expects at least the 'cost-center' tag"
+	method_option :cost_center, :required => true, :aliases => "-c", :type => :array, :desc => "cost-center - space separated list of cost center for the instances"
+	method_option :stack, :aliases => "-s", :type => :array, :desc => "stack - space separated list of stack for the instances"
+	method_option :dry_run, :aliases => "-d", :type => :boolean, :default => :false, :desc => "dry run - does not fix tags"
+	method_option :notify_owner, :aliases => "-n", :type => :boolean, :default => :true, :desc => "notify - notify owner"
+	method_option :no_prompt, :aliases => "-y", :type => :boolean, :default => :false, :desc => "no-prompt - automatic yes to prompts"
+	def audit_tags
+		@@logger.progname = "#{self.class.name}:#{__method__.to_s}"
+		@@logger.info {"[Start] #{__method__.to_s}"}
+		Settings.load!(File.dirname(__FILE__) + '/config/ec2.yml')
+
+		# look up instances
+		filters = Array.new
+		filters << {name: "tag:cost-center", values: options[:cost_center]}
+		filters << {name: "tag:stack", values: options[:stack]} unless options[:stack].nil?
+
+		resp = desc_instances(filters)
+
+		update_tags = false
+
+		resp.reservations.each do |reservation|
+			reservation.instances.each do |instance|
+				begin
+					tags = Array.new
+					Settings.aws[:tags].each do |k, v|
+						update_tags = true if instance.tags.find{|tag| tag.key == v}.nil?
+						val = instance.tags.find{|tag| tag.key == v}.nil? ? "" : instance.tags.find{|tag| tag.key == v}.value
+						tags << {key: v, value: val}
+					end
+					if update_tags then
+						if options[:no_prompt] == :false then
+							tag_instance(instance, tags, options[:dry_run], options[:notify_owner]) unless no?("Update instance tags for #{instance.instance_id}? [y/n]")
+						else
+							tag_instance(instance, tags, options[:dry_run], options[:notify_owner])
+						end
+					end
+				rescue Aws::Errors::ServiceError => e
+					@@logger.error e
+					e.backtrace.each { |line| @@logger.error line }
+					send_notification([@@administrator], "#{@@logger.progname} failed", "audit_tags failed - #{e.message} \n\n#{e.backtrace}.")
+				ensure
+					update_tags = false
+				end
+			end
+		end
+
+		@@logger.info {"[Stop] #{__method__.to_s}"}
+	end
+
+	no_tasks do
+		# describe_instances
+		def desc_instances(filters)
+			begin
+				resp = @@ec2.describe_instances(filters: filters)
+			rescue Aws::Errors::ServiceError => e
+				@@logger.error e
+				e.backtrace.each { |line| @@logger.error line }
+				send_notification([@@administrator], "#{@@logger.progname} initialization failed",
+				"ec2.describe_instances failed - #{e.message} \n\n#{e.backtrace}.")
+				raise e
+			end
+		end
+
+		# Stops an instance
+		def stop_instance(instance, dryrun, notify)
+			name = instance.tags.find{|tag| tag.key == "Name"}.value
+			@@logger.info {"Stopping instance - #{name} (#{instance.instance_id})"}
+			@@ec2.stop_instances(dry_run: dryrun.to_s, instance_ids: [instance.instance_id])
+			if notify then
+				owner = instance.tags.find{|tag| tag.key == "owner"}.value.to_s
+				msg_id = send_notification([owner, @@administrator], "Instance stopped - #{instance.instance_id}",
+				"Dear #{owner},\n\nYour instance (#{name}) has been stopped.\n\nRegards,\nTechOps")
+				@@logger.info {"Notified owner #{owner}; message id - #{msg_id.data.message_id.to_s}"}
+			end
+		end
+
+		# Starts an instance
+		def start_instance(instance, dryrun, notify)
+			name = instance.tags.find{|tag| tag.key == "Name"}.value
+			@@logger.info {"Starting instance - #{name} (#{instance.instance_id})"}
+			@@ec2.start_instances(dry_run: dryrun.to_s, instance_ids: [instance.instance_id])
+			if notify then
+				owner = instance.tags.find{|tag| tag.key == "owner"}.value.to_s
+				msg_id = send_notification([owner, @@administrator], "Instance started - #{instance.instance_id}",
+				"Dear #{owner},\n\nYour instance (#{name}) has been started.\n\nRegards,\nTechOps")
+				@@logger.info {"Notified owner #{owner}; message id - #{msg_id.data.message_id.to_s}"}
+			end
+		end
+
+		# Updates instance tags
+		def tag_instance(instance, tags, dryrun, notify)
+			@@logger.info {"Tagging instance - #{instance.instance_id} with - #{tags}"}
+			@@ec2.create_tags(dry_run: dryrun.to_s, resources: [instance.instance_id], tags: tags)
+			if notify && !instance.tags.find{|tag| tag.key == "owner"}.nil? && !instance.tags.find{|tag| tag.key == "owner"}.value.nil? then
+				owner = instance.tags.find{|tag| tag.key == "owner"}.value.to_s
+				msg_id = send_notification([owner, @@administrator], "Audit AWS Tags : instance tags updated - #{instance.instance_id}",
+				"Dear #{owner},\n\nTags for your instance (#{instance.instance_id}) have been updated.\n\nRegards,\nTechOps")
+				@@logger.info {"Notified owner #{owner}; message id - #{msg_id.data.message_id.to_s}"}
+			end
+		end
+
+		# Send email notification
+		# TODO: use email templates
+		def send_notification(to, subject, msg)
+			to.each {|addr| addr << "@hcentive.com" unless addr.end_with?("@hcentive.com")}
+			msg_id = @@ses.send_email(
+			source: "noreply-product-demo@hcentive.com",
+			destination: {
+				to_addresses: to
+			},
+			message: {
+				subject: {
+					data: subject
+				},
+				body: {
+					text: {data: msg}
+				}
+			}
+			)
+			@@logger.info {"Sent notification to #{to} : message id - #{msg_id.data.message_id.to_s}"}
+			return msg_id
+		end
+	end
+end
+
+Ec2.start

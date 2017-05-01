@@ -1,0 +1,20 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    aws-sdk-core (2.0.0.rc6)
+      builder (~> 3.0)
+      jamespath
+      multi_json (~> 1.0)
+      multi_xml (~> 0.5)
+    builder (3.2.2)
+    jamespath (0.5.0)
+    multi_json (1.9.0)
+    multi_xml (0.5.5)
+    thor (0.18.1)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  aws-sdk-core (~> 2.0)
+  thor (~> 0.18.1)
